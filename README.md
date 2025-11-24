@@ -56,21 +56,67 @@ The MCP server provides a structured four-step workflow for accessing Azure pric
 
 ## Starting the MCP Server
 
+The server supports three different transport methods: **HTTP (Streamable)**, **SSE (Server-Sent Events)**, and **STDIO (Standard I/O)**.
+
+### Command-Line Options
+
 ```bash
-source .venv/bin/activate  # Activate the virtual environment
-python azure_pricing_mcp_server.py
+python azure_pricing_mcp_server.py [OPTIONS]
+
+Options:
+  --transport {sse,stdio,http}  Transport method to use (default: http)
+  --host HOST                   Host address to bind to (default: 0.0.0.0)
+  --port PORT                   Port number (default: 8080)
+  --debug                       Enable debug mode
+  -h, --help                    Show help message
 ```
 
-The server will start at `http://0.0.0.0:8080` by default.
+### Starting with HTTP Transport (Default)
 
-### Available Endpoints
+```bash
+source .venv/bin/activate  # Activate the virtual environment
+python azure_pricing_mcp_server.py --transport http --port 8080
+```
 
-- `GET /sse`: Server-Sent Events endpoint for MCP communication
+Available endpoints:
+- `POST /mcp`: Streamable HTTP endpoint for MCP communication
 - `GET /tools`: Lists the available tools in the MCP server
+
+### Starting with SSE Transport
+
+```bash
+python azure_pricing_mcp_server.py --transport sse --port 8080
+```
+
+Available endpoints:
+- `GET /sse`: Server-Sent Events endpoint for MCP communication
+- `POST /messages/`: Message handling endpoint
+- `GET /tools`: Lists the available tools in the MCP server
+
+### Starting with STDIO Transport
+
+```bash
+python azure_pricing_mcp_server.py --transport stdio
+```
+
+This mode uses standard input/output for communication and is ideal for command-line integration or testing with MCP clients that support STDIO transport.
+
+### Examples
+
+**Start with debug mode:**
+```bash
+python azure_pricing_mcp_server.py --transport http --port 8080 --debug
+```
+
+**Start on a specific host and port:**
+```bash
+python azure_pricing_mcp_server.py --transport sse --host 127.0.0.1 --port 9090
+```
 
 ### MCP Client Configuration
 
-To configure an MCP client to connect to this server, add the following to your `mcp_config.json` file:
+#### For SSE Transport:
+Add the following to your `mcp_config.json` file:
 
 ```json
 "azure-pricing": {
@@ -78,7 +124,22 @@ To configure an MCP client to connect to this server, add the following to your 
 }
 ```
 
-This configuration tells the MCP client to connect to the local server on port 8080 using the SSE endpoint. Make sure the URL matches the address and port your server is running on.
+#### For HTTP (Streamable) Transport:
+```json
+"azure-pricing": {
+  "serverUrl": "http://localhost:8080/mcp"
+}
+```
+
+#### For STDIO Transport:
+```json
+"azure-pricing": {
+  "command": "python",
+  "args": ["azure_pricing_mcp_server.py", "--transport", "stdio"]
+}
+```
+
+This configuration tells the MCP client how to connect to the server. Make sure the URL or command matches your server configuration.
 
 ## MCP Tools
 

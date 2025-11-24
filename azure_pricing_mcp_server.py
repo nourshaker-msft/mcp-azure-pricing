@@ -2,13 +2,15 @@ import logging
 import logging.config
 import uvicorn
 import requests
-from typing import List, Dict, Any
+import argparse
+import asyncio
+from typing import List, Dict, Any, Literal
 
 # MCP imports
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.endpoints import HTTPEndpoint
 
 # Import configuration
@@ -22,6 +24,19 @@ logger = logging.getLogger(__name__)
 if settings.MCP_DEBUG:
     logger.setLevel(logging.DEBUG)
     logger.debug("DEBUG mode activated")
+
+# Suppress expected ClosedResourceError in stateless HTTP sessions
+# These errors occur during normal session termination and are not actual failures
+class SuppressClosedResourceErrorFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress ClosedResourceError in message router - this is expected behavior
+        if "Error in message router" in record.getMessage() and "ClosedResourceError" in str(record.exc_info):
+            return False
+        return True
+
+# Apply filter to MCP streamable HTTP logger
+mcp_http_logger = logging.getLogger("mcp.server.streamable_http")
+mcp_http_logger.addFilter(SuppressClosedResourceErrorFilter())
 
 def log(message: str, level: str = "info"):
     """Helper function for consistent logging."""
@@ -64,6 +79,7 @@ def list_service_families():
         "Dynamics",
         "Gaming",
         "Integration",
+        "AI + Machine Learning",
         "Internet of Things",
         "Management and Governance",
         "Microsoft Syntex",
@@ -515,39 +531,176 @@ class ToolsEndpoint(HTTPEndpoint):
     in the MCP, including their names, descriptions, and expected parameters.
     """
     async def get(self, request):
-        tools = mcp.list_tools()
-        return JSONResponse(tools)
+        tools_list = await mcp.list_tools()
+        # Convert Tool objects to dictionaries for JSON serialization
+        tools_dict = {
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.inputSchema.model_dump() if hasattr(tool.inputSchema, 'model_dump') else tool.inputSchema
+                }
+                for tool in tools_list
+            ]
+        }
+        return JSONResponse(tools_dict)
 
-# Create the Starlette application with routes
-app = Starlette(routes=[
-    Mount("/", app=mcp.sse_app()),
-    Route("/tools", ToolsEndpoint)
-])
 
-# Create the FastAPI application with Model Context Protocol
-def get_application():
-    """Create and return the Starlette application."""
-    return app
+async def run_stdio() -> None:
+    """
+    Run the MCP server with STDIO transport.
+    """
+    log("Starting MCP server with STDIO transport")
+    log("Server will communicate via standard input/output")
+    
+    from mcp.server.stdio import stdio_server
+    
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp._mcp_server.run(
+            read_stream, 
+            write_stream, 
+            mcp._mcp_server.create_initialization_options()
+        )
+
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run the Azure Pricing MCP server with different transport methods."
+    )
+    parser.add_argument(
+        "--transport",
+        type=str,
+        choices=["sse", "stdio", "http"],
+        default="http",
+        help="Transport method to use: 'sse' (Server-Sent Events), 'stdio' (Standard I/O), or 'http' (Streamable HTTP). Default: http",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help=f"Host address to bind to (default: {settings.MCP_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"Port to use for SSE/HTTP transport (default: {settings.MCP_PORT}). Ignored for stdio transport.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    log(f"Starting MCP server at http://{settings.MCP_HOST}:{settings.MCP_PORT}")
-    log(f"SSE Endpoint: http://{settings.MCP_HOST}:{settings.MCP_PORT}/sse")
-    log(f"Tools Endpoint: http://{settings.MCP_HOST}:{settings.MCP_PORT}/tools")
+    args = parse_arguments()
+    
+    # Override settings with command-line arguments if provided
+    if args.debug:
+        settings.MCP_DEBUG = True
+        logger.setLevel(logging.DEBUG)
+    
     log(f"Debug mode: {'ON' if settings.MCP_DEBUG else 'OFF'}")
-    log(f"Auto-reload: {'ENABLED' if settings.MCP_RELOAD else 'DISABLED'}")
+    log(f"Transport: {args.transport.upper()}")
     
-    # Configure uvicorn
-    uvicorn_config = {
-        "app": "azure_pricing_mcp_server:get_application",
-        "host": settings.MCP_HOST,
-        "port": settings.MCP_PORT,
-        "reload": settings.MCP_RELOAD,
-        "log_level": "debug" if settings.MCP_DEBUG else settings.LOG_LEVEL.lower()
-    }
-    
-    logger.debug(f"Uvicorn configuration: {uvicorn_config}")
-    
-    if settings.MCP_DEBUG:
-        logger.debug("DEBUG mode enabled for uvicorn")
-    
-    uvicorn.run(**uvicorn_config)
+    # For stdio transport, use asyncio.run
+    if args.transport == "stdio":
+        asyncio.run(run_stdio(), debug=settings.MCP_DEBUG)
+    else:
+        # For HTTP and SSE transports, we need to handle the event loop differently
+        # because uvicorn.run() creates its own event loop
+        import nest_asyncio
+        nest_asyncio.apply()
+        
+        # Use settings defaults if not provided
+        host = args.host or settings.MCP_HOST
+        port = args.port or settings.MCP_PORT
+        
+        if args.transport == "http":
+            # Streamable HTTP transport
+            log(f"Starting MCP server with Streamable HTTP transport at http://{host}:{port}")
+            log(f"MCP Endpoint: http://{host}:{port}/mcp")
+            log(f"Tools Endpoint: http://{host}:{port}/tools")
+            
+            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+            import contextlib
+            from starlette.types import Receive, Scope, Send
+            from typing import AsyncIterator
+            
+            session_manager = StreamableHTTPSessionManager(
+                app=mcp._mcp_server,
+                event_store=None,
+                json_response=True,
+                stateless=True,
+            )
+            
+            async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
+                await session_manager.handle_request(scope, receive, send)
+            
+            @contextlib.asynccontextmanager
+            async def lifespan(app: Starlette) -> AsyncIterator[None]:
+                """Context manager for session manager."""
+                async with session_manager.run():
+                    try:
+                        yield
+                    finally:
+                        log("Application shutting down...")
+            
+            starlette_app = Starlette(
+                debug=settings.MCP_DEBUG,
+                routes=[
+                    Mount("/mcp", app=handle_streamable_http),
+                    Route("/tools", ToolsEndpoint),
+                ],
+                lifespan=lifespan,
+            )
+            
+            uvicorn.run(
+                starlette_app, 
+                host=host, 
+                port=port,
+                log_level="debug" if settings.MCP_DEBUG else settings.LOG_LEVEL.lower()
+            )
+        
+        elif args.transport == "sse":
+            # SSE transport
+            log(f"Starting MCP server with SSE transport at http://{host}:{port}")
+            log(f"SSE Endpoint: http://{host}:{port}/sse")
+            log(f"Messages Endpoint: http://{host}:{port}/messages/")
+            log(f"Tools Endpoint: http://{host}:{port}/tools")
+            
+            from mcp.server.sse import SseServerTransport
+            
+            sse = SseServerTransport("/messages/")
+            
+            async def handle_sse(request):
+                async with sse.connect_sse(
+                    request.scope, 
+                    request.receive, 
+                    request._send
+                ) as (read_stream, write_stream):
+                    await mcp._mcp_server.run(
+                        read_stream, 
+                        write_stream, 
+                        mcp._mcp_server.create_initialization_options()
+                    )
+                return Response(status_code=204)
+            
+            starlette_app = Starlette(
+                debug=settings.MCP_DEBUG,
+                routes=[
+                    Route("/sse", endpoint=handle_sse),
+                    Mount("/messages/", app=sse.handle_post_message),
+                    Route("/tools", ToolsEndpoint),
+                ],
+            )
+            
+            uvicorn.run(
+                starlette_app, 
+                host=host, 
+                port=port,
+                log_level="debug" if settings.MCP_DEBUG else settings.LOG_LEVEL.lower()
+            )

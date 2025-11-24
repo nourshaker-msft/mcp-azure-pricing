@@ -8,10 +8,12 @@ pydantic>=1.10.0
 # MCP server
 mcp-server>=0.1.0
 
+# MCP transport dependencies
+anyio>=3.6.0
+nest-asyncio>=1.5.6
+
 # Utilities
 tabulate>=0.9.0
 python-dotenv>=0.21.0
-
-# Azure-specific (if needed)
-# azure-core>=1.26.0
-# azure-identity>=1.12.0
+fastmcp
+pydantic-settings

@@ -10,7 +10,7 @@ import os
 
 # Valores por defecto
 DEFAULT_HOST = '0.0.0.0'
-DEFAULT_PORT = 8080
+DEFAULT_PORT = 8081
 DEFAULT_LOG_LEVEL = 'INFO'
 
 class Settings(BaseSettings):
